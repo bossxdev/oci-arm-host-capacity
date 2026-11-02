@@ -1,0 +1,35 @@
+services:
+  oci-provisioner:
+    build: .
+    init: true
+    restart: "no"
+    read_only: true
+    user: "10001:10001"
+    working_dir: /var/lib/oci-provisioner
+    env_file: .env
+    environment:
+      OCI_CONTAINER_MODE: "1"
+      OCI_ENABLE_PROVISIONING: "${OCI_ENABLE_PROVISIONING:-false}"
+      DRY_RUN: "${DRY_RUN:-true}"
+      OCI_PRIVATE_KEY_FILENAME: /run/secrets/oci_api_key
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+    volumes:
+      - oci_state:/var/lib/oci-provisioner
+    secrets:
+      - oci_api_key
+      - telegram_bot_token
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+secrets:
+  oci_api_key:
+    file: ./secrets/oci_api_key.pem
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token
+
+volumes:
+  oci_state:

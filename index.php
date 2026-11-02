@@ -13,11 +13,31 @@ use Hitrov\FileCache;
 use Hitrov\OciApi;
 use Hitrov\OciConfig;
 use Hitrov\TooManyRequestsWaiter;
+use Hitrov\InstanceMonitor;
+use Hitrov\LaunchState;
 
 $envFilename = empty($argv[1]) ? '.env' : $argv[1];
 $dotenv = Dotenv::createUnsafeImmutable(__DIR__, $envFilename);
 $dotenv->safeLoad();
 
+$dryRun = getenv('DRY_RUN') !== 'false';
+// Container execution is read-only unless provisioning is explicitly enabled.
+if (getenv('OCI_CONTAINER_MODE') === '1' && !$dryRun && getenv('OCI_ENABLE_PROVISIONING') !== 'true') {
+    echo "Provisioning disabled; set DRY_RUN=true to validate OCI read-only.\n";
+    return;
+}
+
+if ($dryRun || getenv('OCI_CONTAINER_MODE') === '1') {
+    $required = [
+        'OCI_REGION', 'OCI_USER_ID', 'OCI_TENANCY_ID', 'OCI_KEY_FINGERPRINT',
+        'OCI_PRIVATE_KEY_FILENAME', 'OCI_SUBNET_ID', 'OCI_IMAGE_ID', 'OCI_SSH_PUBLIC_KEY',
+    ];
+    foreach ($required as $name) {
+        if (getenv($name) === false || trim((string) getenv($name)) === '') {
+            throw new \InvalidArgumentException("Missing $name");
+        }
+    }
+}
 /*
  * No need to modify any value in this file anymore!
  * Copy .env.example to .env and adjust there instead.
@@ -45,12 +65,24 @@ if ($bootVolumeSizeInGBs) {
     $config->setBootVolumeId($bootVolumeId);
 }
 
+if ($dryRun || getenv('OCI_CONTAINER_MODE') === '1') {
+    if (getenv('OCI_SHAPE') !== 'VM.Standard.A1.Flex' ||
+        $config->ocpus < 1 || $config->ocpus > 2 ||
+        $config->memoryInGBs < 1 || $config->memoryInGBs > 12 ||
+        (getenv('OCI_MAX_INSTANCES') !== false && (int) getenv('OCI_MAX_INSTANCES') !== 1)) {
+        throw new \InvalidArgumentException('Only one Always Free A1 instance (up to 2 OCPU / 12 GB) is supported');
+    }
+    $config->getSourceDetails();
+}
+
 $api = new OciApi();
-if (getenv('CACHE_AVAILABILITY_DOMAINS')) {
+if (!$dryRun && getenv('CACHE_AVAILABILITY_DOMAINS')) {
     $api->setCache(new FileCache($config));
 }
-if (getenv('TOO_MANY_REQUESTS_TIME_WAIT')) {
-    $api->setWaiter(new TooManyRequestsWaiter((int) getenv('TOO_MANY_REQUESTS_TIME_WAIT')));
+$waiter = new TooManyRequestsWaiter((int) (getenv('TOO_MANY_REQUESTS_TIME_WAIT') ?: 600));
+$api->setWaiter($waiter);
+if ($waiter->isTooEarly()) {
+    throw new \Hitrov\Exception\TooManyRequestsWaiterException("Will retry after {$waiter->secondsRemaining()} seconds");
 }
 $notifier = (function (): \Hitrov\Interfaces\NotifierInterface {
     /*
@@ -66,20 +98,50 @@ $notifier = (function (): \Hitrov\Interfaces\NotifierInterface {
 
 $shape = getenv('OCI_SHAPE');
 
+$notifyFailure = static function (string $message) use ($notifier): void {
+    if (!$notifier->isSupported()) {
+        return;
+    }
+    try {
+        $notifier->notify("[OCI] $message");
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "Telegram delivery failed; notification dropped.\n");
+    }
+};
+
+
 $maxRunningInstancesOfThatShape = 1;
 if (getenv('OCI_MAX_INSTANCES') !== false) {
     $maxRunningInstancesOfThatShape = (int) getenv('OCI_MAX_INSTANCES');
 }
 
-$instances = $api->getInstances($config);
+$launchState = $dryRun ? null : new LaunchState(getcwd());
+$api->assertHomeRegion($config);
+$instances = $api->getTenancyInstances($config);
+if ($launchState !== null && ($pending = $launchState->current()) !== null) {
+    if (empty($pending['instance_id'])) {
+        foreach ($instances as $instance) {
+            if (($instance['displayName'] ?? '') === $pending['display_name'] && !empty($instance['id'])) {
+                $launchState->observed($instance['id']);
+                break;
+            }
+        }
+        if (empty($launchState->current()['instance_id'])) {
+            $notifyFailure('Previous launch result is unknown; manual inspection required.');
+            throw new \RuntimeException('Previous launch result is unknown; inspect OCI before retrying');
+        }
+    }
+    InstanceMonitor::check($api, $config, $launchState, $notifier);
+    return;
+}
 
 $existingInstances = $api->checkExistingInstances($config, $instances, $shape, $maxRunningInstancesOfThatShape);
-if ($existingInstances) {
+if ($existingInstances && !$dryRun) {
     echo "$existingInstances\n";
     return;
 }
 
-if (!empty($config->availabilityDomains)) {
+if (!$dryRun && !empty($config->availabilityDomains)) {
     if (is_array($config->availabilityDomains)) {
         $availabilityDomains = $config->availabilityDomains;
     } else {
@@ -89,37 +151,57 @@ if (!empty($config->availabilityDomains)) {
     $availabilityDomains = $api->getAvailabilityDomains($config);
 }
 
+$api->checkLaunchResources($config);
+
+if ($dryRun) {
+    echo 'Dry-run: validated OCI access, found ' . count($instances) . ' active A1 instance(s) across the tenancy and ' . count($availabilityDomains) . " availability domain(s); no launch sent.\n";
+    return;
+}
+
+$waitSeconds = $launchState->secondsUntilRetry();
+if ($waitSeconds > 0) {
+    echo "Capacity backoff active; retry in {$waitSeconds} seconds.\n";
+    $notifyFailure("Capacity backoff active; next attempt in {$waitSeconds} seconds.");
+    return;
+}
+$launchState->clearRetry();
+
 foreach ($availabilityDomains as $availabilityDomainEntity) {
     $availabilityDomain = is_array($availabilityDomainEntity) ? $availabilityDomainEntity['name'] : $availabilityDomainEntity;
+    $attempt = $launchState->begin();
     try {
-        $instanceDetails = $api->createInstance($config, $shape, getenv('OCI_SSH_PUBLIC_KEY'), $availabilityDomain);
-    } catch(ApiCallException $e) {
-        $message = $e->getMessage();
-        echo "$message\n";
-//            if ($notifier->isSupported()) {
-//                $notifier->notify($message);
-//            }
-
-        if (
-            $e->getCode() === 500 &&
-            strpos($message, 'InternalError') !== false &&
-            strpos($message, 'Out of host capacity') !== false
-        ) {
-            // trying next availability domain
+        $instanceDetails = $api->createInstance($config, $shape, getenv('OCI_SSH_PUBLIC_KEY'), $availabilityDomain, $attempt['token'], $attempt['display_name']);
+    } catch (\Hitrov\Exception\TooManyRequestsWaiterException $e) {
+        if ($e->getCode() === 429) {
+            $launchState->capacityRejected(); // OCI explicitly rejected this request as throttled.
+            $notifyFailure('OCI rate limited (429); cooldown started. Attempt cleared.');
+        }
+        throw $e;
+    } catch (ApiCallException $e) {
+        $response = json_decode($e->getMessage(), true);
+        if ($e->getCode() === 500 &&
+            ($response['code'] ?? '') === 'InternalError' &&
+            ($response['message'] ?? '') === 'Out of host capacity.') {
+            $launchState->capacityRejected();
             sleep(16);
             continue;
         }
-
-        // current config is broken
-        return;
+        $notifyFailure("Launch failed: HTTP {$e->getCode()}. Attempt stays pending; manual inspection required.");
+        throw $e;
+    } catch (\Hitrov\Exception\CurlException $e) {
+        $notifyFailure('Launch result unknown (transport error). Attempt stays pending; manual inspection required.');
+        throw $e;
     }
 
-    // success
-    $message = json_encode($instanceDetails, JSON_PRETTY_PRINT);
-    echo "$message\n";
-    if ($notifier->isSupported()) {
-        $notifier->notify($message);
+    if (empty($instanceDetails['id']) || ($instanceDetails['displayName'] ?? '') !== $attempt['display_name']) {
+        $notifyFailure('Launch response missing expected instance identity; manual inspection required.');
+        throw new \UnexpectedValueException('Launch response has no matching instance ID');
     }
-
+    $launchState->observed($instanceDetails['id']);
+    InstanceMonitor::check($api, $config, $launchState, $notifier);
     return;
 }
+
+$minutes = $launchState->scheduleRetry();
+echo "Out of host capacity in every availability domain; next attempt in {$minutes} seconds.\n";
+$notifyFailure("Out of host capacity in every availability domain; next attempt in {$minutes} seconds.");

@@ -40,20 +40,18 @@ class OciApi
         OciConfig $config,
         string $shape,
         string $sshKey,
-        string $availabilityDomain
+        string $availabilityDomain,
+        ?string $retryToken = null,
+        ?string $instanceName = null
     ): array
     {
-        if (isset($this->waiter) && $this->waiter->isConfigured()) {
-            if ($this->waiter->isTooEarly()) {
-                throw new TooManyRequestsWaiterException(
-                    "Will retry after {$this->waiter->secondsRemaining()} seconds",
-                );
-            }
-
-            $this->waiter->remove();
+        if ($shape === 'VM.Standard.A1.Flex' &&
+            ($config->ocpus < 1 || $config->ocpus > 2 || $config->memoryInGBs < 1 || $config->memoryInGBs > 12)) {
+            throw new \InvalidArgumentException('A1 configuration exceeds the Always Free 2 OCPU / 12 GB limit');
         }
 
-        $displayName = 'instance-' . date('Ymd-Hi');
+
+        $displayName = $instanceName ?? 'instance-' . date('Ymd-Hi');
 
         $body = <<<EOD
 {
@@ -97,21 +95,7 @@ EOD;
 
         $baseUrl = "{$this->getBaseApiUrl($config)}/instances/";
 
-        try {
-            return $this->call($config, $baseUrl, 'POST', $body);
-        } catch(ApiCallException $e) {
-            $message = $e->getMessage();
-            if ($e->getCode() != 429 && strpos($message, 'TooManyRequests') === false) {
-                throw $e;
-            }
-
-            if (!isset($this->waiter) || !$this->waiter->isConfigured()) {
-                throw $e;
-            }
-
-            $this->waiter->enable();
-            throw new TooManyRequestsWaiterException($message);
-        }
+        return $this->call($config, $baseUrl, 'POST', $body, [], $nextPage, $retryToken);
     }
 
     /**
@@ -130,6 +114,130 @@ EOD;
         $params = ['compartmentId' => $config->tenancyId];
 
         return $this->call($config, $baseUrl, 'GET', null, $params);
+    }
+
+    public function getInstance(OciConfig $config, string $id): array
+    {
+        return $this->call($config, "{$this->getBaseApiUrl($config)}/instances/" . rawurlencode($id));
+    }
+
+    public function assertHomeRegion(OciConfig $config): void
+    {
+        $url = "{$this->getBaseApiUrl($config, 'identity')}/tenancies/{$config->tenancyId}/regionSubscriptions";
+        foreach ($this->listPages($config, $url, []) as $subscription) {
+            if (($subscription['regionName'] ?? '') === $config->region &&
+                ($subscription['isHomeRegion'] ?? false) === true &&
+                ($subscription['status'] ?? '') === 'READY') {
+                return;
+            }
+        }
+        throw new \UnexpectedValueException('OCI_REGION is not the ready home region');
+    }
+
+    public function checkLaunchResources(OciConfig $config): void
+    {
+        $base = $this->getBaseApiUrl($config);
+        $subnet = $this->call($config, "$base/subnets/{$config->subnetId}");
+        if (($subnet['id'] ?? null) !== $config->subnetId ||
+            ($subnet['lifecycleState'] ?? null) !== 'AVAILABLE') {
+            throw new \UnexpectedValueException('OCI subnet is not available');
+        }
+
+        $source = json_decode($config->getSourceDetails(), true, 512, JSON_THROW_ON_ERROR);
+        if ($source['sourceType'] !== 'image') {
+            throw new \UnexpectedValueException('Only image-based launch is supported by preflight');
+        }
+        if (isset($source['bootVolumeSizeInGBs']) &&
+            (!ctype_digit((string) $source['bootVolumeSizeInGBs']) ||
+                (int) $source['bootVolumeSizeInGBs'] < 50 ||
+                (int) $source['bootVolumeSizeInGBs'] > 200)) {
+            throw new \UnexpectedValueException('Boot volume size must be between 50 and 200 GB');
+        }
+        $image = $this->call($config, "$base/images/{$config->imageId}");
+        if (($image['id'] ?? null) !== $config->imageId ||
+            ($image['lifecycleState'] ?? null) !== 'AVAILABLE') {
+            throw new \UnexpectedValueException('OCI image is not available');
+        }
+        $compatible = false;
+        foreach ($this->listPages($config, "$base/images/{$config->imageId}/shapes", []) as $entry) {
+            if (($entry['shape'] ?? null) !== 'VM.Standard.A1.Flex') {
+                continue;
+            }
+            $memory = $entry['memoryConstraints'] ?? [];
+            $ocpus = $entry['ocpuConstraints'] ?? [];
+            if (($memory['minInGBs'] ?? 0) > $config->memoryInGBs ||
+                ($memory['maxInGBs'] ?? PHP_INT_MAX) < $config->memoryInGBs ||
+                ($ocpus['min'] ?? 0) > $config->ocpus ||
+                ($ocpus['max'] ?? PHP_INT_MAX) < $config->ocpus) {
+                throw new \UnexpectedValueException('OCI image does not support configured A1 resources');
+            }
+            $compatible = true;
+        }
+        if (!$compatible) {
+            throw new \UnexpectedValueException('OCI image is not compatible with A1');
+        }
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function getTenancyInstances(OciConfig $config): array
+    {
+        $compartments = $this->listPages(
+            $config,
+            "{$this->getBaseApiUrl($config, 'identity')}/compartments/",
+            ['compartmentId' => $config->tenancyId, 'compartmentIdInSubtree' => 'true', 'accessLevel' => 'ANY']
+        );
+
+        $instances = [];
+        foreach (array_merge([['id' => $config->tenancyId]], $compartments) as $compartment) {
+            if (!is_array($compartment) || empty($compartment['id'])) {
+                throw new \UnexpectedValueException('OCI compartment response has no id');
+            }
+            if (($compartment['lifecycleState'] ?? 'ACTIVE') === 'DELETED') {
+                continue;
+            }
+            foreach ($this->listPages(
+                $config,
+                "{$this->getBaseApiUrl($config)}/instances/",
+                ['compartmentId' => $compartment['id']]
+            ) as $instance) {
+                if (!is_array($instance) || !isset($instance['shape'], $instance['lifecycleState'])) {
+                    throw new \UnexpectedValueException('OCI instance response is incomplete');
+                }
+                if ($instance['shape'] === 'VM.Standard.A1.Flex' && $instance['lifecycleState'] !== 'TERMINATED') {
+                    $instances[] = $instance;
+                }
+            }
+        }
+
+        return $instances;
+    }
+
+    private function listPages(OciConfig $config, string $url, array $params): array
+    {
+        $items = [];
+        $seenPages = [];
+        $page = null;
+        do {
+            if ($page !== null) {
+                if (isset($seenPages[$page])) {
+                    throw new \UnexpectedValueException('OCI pagination did not advance');
+                }
+                $seenPages[$page] = true;
+                $params['page'] = $page;
+            }
+            $nextPage = null;
+            $batch = $this->call($config, $url, 'GET', null, $params, $nextPage);
+            if (!is_array($batch) || array_values($batch) !== $batch) {
+                throw new \UnexpectedValueException('OCI list response must be an array');
+            }
+            array_push($items, ...$batch);
+            if ($nextPage !== null && $nextPage === $page) {
+                throw new \UnexpectedValueException('OCI pagination did not advance');
+            }
+            $page = $nextPage;
+        } while ($page !== null && $page !== '');
+
+        return $items;
     }
 
     public function checkExistingInstances(OciConfig $config, array $listResponse, string $shape, int $maxRunningInstancesOfThatShape): string
@@ -220,9 +328,14 @@ EOD;
         string $baseUrl = '',
         string $method = 'GET',
         string $body = null,
-        array $params = []
+        array $params = [],
+        ?string &$nextPage = null,
+        ?string $retryToken = null
     )
     {
+        if (isset($this->waiter) && $this->waiter->isConfigured() && $this->waiter->isTooEarly()) {
+            throw new TooManyRequestsWaiterException("Will retry after {$this->waiter->secondsRemaining()} seconds");
+        }
         $paramsString = '';
         if ($params) {
             $paramsString = '?' . http_build_query($params);
@@ -238,6 +351,9 @@ EOD;
         );
 
         $headers = $signer->getHeaders($url, $method, $body, 'application/json');
+        if ($retryToken !== null) {
+            $headers[] = 'opc-retry-token: ' . $retryToken;
+        }
 
         $curlOptions = [
             CURLOPT_URL => $url,
@@ -254,7 +370,20 @@ EOD;
             $curlOptions[CURLOPT_POSTFIELDS] = $body;
         }
 
-        return HttpClient::getResponse($curlOptions);
+        try {
+            return $this->send($curlOptions, $nextPage);
+        } catch (ApiCallException $e) {
+            if ($e->getCode() === 429 && isset($this->waiter) && $this->waiter->isConfigured()) {
+                $this->waiter->enable();
+                throw new TooManyRequestsWaiterException('OCI rate limited; retry after cooldown', 429, $e);
+            }
+            throw $e;
+        }
+    }
+
+    protected function send(array $curlOptions, ?string &$nextPage = null): array
+    {
+        return HttpClient::getResponse($curlOptions, $nextPage);
     }
 
     public function setWaiter(TooManyRequestsWaiterInterface $waiter): void

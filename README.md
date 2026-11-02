@@ -1,4 +1,4 @@
-# Resolving Oracle Cloud "Out of Capacity" issue and getting free VPS with 4 ARM cores / 24GB of memory
+# Resolving Oracle Cloud "Out of Capacity" issue for an Always Free Ampere A1 VPS
 
 <p align="center">
   <a href="https://github.com/hitrov/oci-arm-host-capacity/actions"><img src="https://github.com/hitrov/oci-arm-host-capacity/workflows/Tests/badge.svg" alt="Test"></a>
@@ -8,7 +8,7 @@
 
 Very neat and useful configuration was recently [announced](https://blogs.oracle.com/cloud-infrastructure/post/moving-to-ampere-a1-compute-instances-on-oracle-cloud-infrastructure-oci) at Oracle Cloud Infrastructure (OCI) blog as a part of Always Free tier. Sometimes it's complicated to launch an instance due to the "Out of Capacity" error. Here we're solving that issue as Oracle constantly adds capacity from time to time.
 
-> Each tenancy gets the first 3,000 OCPU hours and 18,000 GB hours per month for free to create Ampere A1 Compute instances using the VM.Standard.A1.Flex shape (equivalent to 4 OCPUs and 24 GB of memory).
+> Oracle currently includes 1,500 OCPU-hours and 9,000 GB-hours monthly for Ampere A1, equivalent to 2 OCPUs and 12 GB RAM running continuously in an Always Free tenancy. These limits are shared across the tenancy; verify your account's eligibility and other resources before provisioning. See [Oracle's Always Free resources](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm).
 
 This approach requires **PHP 7.x or 8.x** and **composer** installed and will call "LaunchInstance" OCI API [endpoint](https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Instance/LaunchInstance). We'll utilise the [package](https://packagist.org/packages/hitrov/oci-api-php-request-sign) which I've written (and [published](https://github.com/hitrov/oci-api-php-request-sign)) some time ago, here's the [article](https://hitrov.medium.com/creating-mini-php-sdk-to-sign-oracle-cloud-infrastructure-api-requests-d91a224c7008?sk=5b4405c1124bfeac30a370630fd94126).
 
@@ -152,8 +152,10 @@ Change `OCI_SSH_PUBLIC_KEY` inside double quotes - paste the contents above (or 
 
 #### Optional
 
-`OCI_OCPUS` and `OCI_MEMORY_IN_GBS` are set `4` and `24` by default. Of course, you can safely adjust them. 
-Possible values are 1/6, 2/12, 3/18 and 4/24, respectively.
+`OCI_OCPUS` and `OCI_MEMORY_IN_GBS` default to `2` and `12`. Always Free A1 is limited to 2 OCPUs and 12 GB RAM **in total across the tenancy**. Inventory now lists A1 instances in all compartments with pagination; missing IAM permissions stop the run, but OCI storage/eligibility still need manual review.
+
+`DRY_RUN=true` checks configuration, home region, A1 inventory, availability domains, subnet/image availability, and image/shape compatibility without calling `LaunchInstance`. It accepts image-based launches with an optional 50–200 GB boot volume; boot-volume-ID launches stop at preflight. Dry-run is the default even without an explicit setting; `php ./index.php` may launch only after deliberately setting `DRY_RUN=false`.
+
 Please notice that "Oracle Linux Cloud Developer" image can be created with at least 8GB of RAM (`OCI_MEMORY_IN_GBS`).
 
 If for some reason your home region is running out of Always free AMD x64 (1/8 OPCU + 1GB RAM), replace values below.
@@ -174,7 +176,7 @@ When you managed to launch one and need more (or 2 from scratch), set to `OCI_MA
 php ./index.php
 ```
 
-I bet that the output (error) will be similar to the one in a browser a few minutes ago
+With `DRY_RUN=true`, the script reports read-only checks and never launches. After explicitly setting `DRY_RUN=false`, an OCI launch failure may look like:
 ```json
 {
     "code": "InternalError",
@@ -188,6 +190,20 @@ or if you already have instances:
     "message": "The following service limits were exceeded: standard-a1-memory-count, standard-a1-core-count. Request a service limit increase from the service limits page in the console. "
 }
 ```
+
+## Docker (single run, disabled by default)
+
+This is a one-shot container, **not** a retry worker. `DRY_RUN=true` performs read-only OCI checks. Real launches save a pending attempt before POST in `launch.sqlite` and use `opc-retry-token` under `launch.lock`. After timeout/restart the next enabled run checks inventory: if the instance is found, it monitors the saved OCID; otherwise it stops for manual investigation without another POST. Do not delete the state database while an attempt is unresolved.
+
+1. Copy `.env.example` to `.env` and supply OCI values. Docker overrides `OCI_PRIVATE_KEY_FILENAME` with `/run/secrets/oci_api_key`; keep private keys and Telegram tokens out of `.env`.
+2. Place the OCI PEM at `secrets/oci_api_key.pem` and a Telegram bot token at `secrets/telegram_bot_token` (both required by this Compose file even when notifications are unused). Restrict host file permissions. Both files are mounted as read-only Compose secrets; set `TELEGRAM_USER_ID` in `.env` to enable notifications.
+3. Run `docker compose build` then `docker compose run --rm oci-provisioner`. The default dry-run checks OCI without creating resources; the container runs as UID 10001 with read-only root filesystem, no published ports and a named volume for the existing cache/cooldown files.
+
+Only setting **both** `DRY_RUN=false` and `OCI_ENABLE_PROVISIONING=true` in `.env` (or the Compose shell environment) enables real `LaunchInstance` requests. Capacity rejection permits another AD; ambiguous failures remain pending and require manual investigation. This is not automatic retry/recovery: token validity is limited to 24 hours, and this code does not replay unknown requests. Compose has no restart policy or retry loop. **Preflight cannot establish Always Free image labeling or free storage quota.** Review these in OCI before a real launch.
+
+After a successful launch response, one `GetInstance` checks lifecycle. `PROVISIONING`/`STARTING` prints a status and exits; run the one-shot command again to check `RUNNING`. Only `RUNNING` marks success and sends Telegram; an unsuccessful Telegram request stays pending in SQLite for retry on the next enabled run. A crash **after** Telegram accepts the message but **before** SQLite records acknowledgment can duplicate that message—Telegram `sendMessage` has no idempotency token. No credentials or live account were exercised in automated checks.
+
+When every availability domain reports `Out of host capacity`, the run records a persistent backoff in SQLite: 5 → 10 → 20 → 40 → 60 minutes (ceiling). The next enabled run exits before any launch attempt while the backoff is active; a successful launch clears it. There is no in-process loop—the schedule advances only when you re-run the enabled command. Dry-run is not blocked by capacity backoff.
 
 ## Periodic job setup (cron)
 

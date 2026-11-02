@@ -20,7 +20,7 @@ class Telegram implements NotifierInterface
      */
     public function notify(string $message): array
     {
-        $apiKey = getenv('TELEGRAM_BOT_API_KEY');
+        $apiKey = $this->getApiKey();
         $telegramUserId = getenv('TELEGRAM_USER_ID');
 
         $body = http_build_query([
@@ -44,6 +44,20 @@ class Telegram implements NotifierInterface
 
     public function isSupported(): bool
     {
-        return !empty(getenv('TELEGRAM_BOT_API_KEY')) && !empty(getenv('TELEGRAM_USER_ID'));
+        return $this->getApiKey() !== '' && !empty(getenv('TELEGRAM_USER_ID'));
+    }
+
+    private function getApiKey(): string
+    {
+        $file = getenv('TELEGRAM_BOT_TOKEN_FILE');
+        if ($file !== false && $file !== '') {
+            $token = file_get_contents($file);
+            if ($token === false) {
+                throw new \RuntimeException('Cannot read Telegram token file');
+            }
+            return trim($token);
+        }
+
+        return (string) getenv('TELEGRAM_BOT_API_KEY');
     }
 }

@@ -25,6 +25,10 @@ class OciApiTest extends TestCase
      */
     protected function setUp(): void
     {
+        if (getenv('OCI_INTEGRATION_TESTS') !== '1') {
+            $this->markTestSkipped('Live OCI test: set OCI_INTEGRATION_TESTS=1 with disposable credentials');
+        }
+
         $this->setEnv();
 
         self::$config = $this->getDefaultConfig();

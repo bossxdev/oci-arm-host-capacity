@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+!.env.example
+secrets/
+data/
+vendor/
+tests/
+images/
+oci_cache.json
+too_many_requests_waiter.txt
+oci.log

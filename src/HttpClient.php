@@ -16,9 +16,16 @@ class HttpClient
      * @throws ApiCallException
      * @throws JsonException|CurlException
      */
-    public static function getResponse(array $curlOptions): array
+    public static function getResponse(array $curlOptions, ?string &$nextPage = null): array
     {
         $curl = curl_init();
+        $nextPage = null;
+        $curlOptions[CURLOPT_HEADERFUNCTION] = static function ($curl, string $header) use (&$nextPage): int {
+            if (stripos($header, 'opc-next-page:') === 0) {
+                $nextPage = trim(substr($header, strlen('opc-next-page:')));
+            }
+            return strlen($header);
+        };
         curl_setopt_array($curl, $curlOptions);
 
         $response = curl_exec($curl);

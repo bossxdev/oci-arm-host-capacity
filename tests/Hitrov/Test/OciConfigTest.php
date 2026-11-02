@@ -19,6 +19,7 @@ class OciConfigTest extends TestCase
      */
     protected function setUp(): void
     {
+        $this->loadEnv();
         self::$config = $this->getDefaultConfig();
         self::$api = $this->getDefaultApi();
     }

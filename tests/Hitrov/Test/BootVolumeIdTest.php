@@ -21,8 +21,11 @@ class BootVolumeIdTest extends TestCase
      */
     protected function setUp(): void
     {
-        $this->loadEnv();
+        if (getenv('OCI_INTEGRATION_TESTS') !== '1') {
+            $this->markTestSkipped('Live OCI test: set OCI_INTEGRATION_TESTS=1 with disposable credentials');
+        }
 
+        $this->loadEnv();
         self::$config = $this->getDefaultConfig();
         self::$api = $this->getDefaultApi();
     }

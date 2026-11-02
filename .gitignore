@@ -1,2 +1,11 @@
 vendor/
 .env
+.env.*
+!.env.example
+secrets/
+data/
+oci_cache.json
+too_many_requests_waiter.txt
+oci.log
+launch.sqlite*
+launch.lock
